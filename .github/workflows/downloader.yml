@@ -5,8 +5,8 @@ on:
   workflow_dispatch:
   
   # Scheduled to run every 8 hours automatically
-  schedule:
-    - cron: '0 */8 * * *'  # Runs at 00:00, 08:00, and 16:00 UTC every day
+  # schedule:
+  #   - cron: '0 */8 * * *'  # Runs at 00:00, 08:00, and 16:00 UTC every day
   
   # Trigger on push to main (when batch files are updated)
   push:
@@ -15,6 +15,11 @@ on:
     paths:
       - 'batch_progress.txt'
       - 'all_links.txt'
+
+# Prevent multiple workflows from running simultaneously
+# concurrency:
+#   group: video-download-batch
+#   cancel-in-progress: false  # Don't cancel, just queue them
 
 jobs:
   download-videos:
