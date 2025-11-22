@@ -19,6 +19,7 @@ on:
 jobs:
   download-videos:
     runs-on: windows-2025
+    timeout-minutes: 350  # 5h 50m - safety margin before 6h GitHub limit
     
     steps:
       - name: Checkout repository
@@ -145,12 +146,22 @@ jobs:
 
       - name: Trigger next workflow run
         if: steps.check_batch.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Check if there are more batches to process
           python -c "from batch_manager import get_batch_info; info = get_batch_info(); exit(0 if info['links_remaining'] > 0 else 1)"
           
           if ($LASTEXITCODE -eq 0) {
-            Write-Host "More batches remaining. Workflow will be triggered by the commit."
+            Write-Host "More batches remaining. Triggering next workflow run immediately..."
+            
+            # Wait a bit for commit to complete
+            Start-Sleep -Seconds 30
+            
+            # Trigger workflow_dispatch to start next batch immediately
+            gh workflow run downloader.yml --ref main
+            
+            Write-Host "Next workflow triggered successfully!"
           } else {
             Write-Host "All batches completed! 🎉"
           }
