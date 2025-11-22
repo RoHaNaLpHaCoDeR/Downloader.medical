@@ -1,14 +1,30 @@
-name: Download Videos
+name: Auto Download Videos
 
 on:
+  # Manual trigger
   workflow_dispatch:
+  
+  # Scheduled to run every 8 hours automatically
+  schedule:
+    - cron: '0 */8 * * *'  # Runs at 00:00, 08:00, and 16:00 UTC every day
+  
+  # Trigger on push to main (when batch files are updated)
+  push:
+    branches:
+      - main
+    paths:
+      - 'batch_progress.txt'
+      - 'all_links.txt'
 
 jobs:
   download-videos:
     runs-on: windows-2025
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for proper git operations
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -20,72 +36,140 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Selenium script
+      - name: Check batch status
+        id: check_batch
+        run: |
+          python -c "from batch_manager import get_batch_info, print_batch_status; print_batch_status(); info = get_batch_info(); exit(0 if info['links_remaining'] > 0 else 1)"
+        continue-on-error: true
+
+      - name: Run download script
+        if: steps.check_batch.outcome == 'success'
         run: |
           python ReelDownloader.py
 
-      - name: Commit counter.txt if changed
+      - name: Clean up temp folder
+        if: always()
         run: |
-          if ((git diff --quiet counter.txt)) {
-            Write-Host "No changes to counter.txt"
-          } else {
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add counter.txt
-            git commit -m "Update counter.txt"
-            git pull --rebase origin main || Write-Host "No changes to pull"
-            git push origin main
-            Write-Host "Committed and pushed counter.txt"
+          if (Test-Path "temp") {
+            Remove-Item -Path "temp\*" -Force -Recurse -ErrorAction SilentlyContinue
+            Write-Host "Cleaned up temp folder"
           }
 
-      - name: Commit links.txt if changed
+      - name: Archive and clear VIDEOS folder
+        if: steps.check_batch.outcome == 'success'
         run: |
-          if ((git diff --quiet links.txt)) {
-            Write-Host "No changes to links.txt"
+          # Create archive directory with timestamp and batch number
+          $batchNum = Get-Content "batch_progress.txt"
+          $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+          $archiveName = "batch_${batchNum}_${timestamp}"
+          
+          # Count videos in VIDEOS folder
+          $videoCount = (Get-ChildItem -Path "VIDEOS" -Filter "*.mp4" -ErrorAction SilentlyContinue).Count
+          
+          if ($videoCount -gt 0) {
+            Write-Host "Found $videoCount videos in VIDEOS folder"
+            Write-Host "Creating archive: $archiveName"
+            
+            # Create a zip archive
+            New-Item -ItemType Directory -Force -Path "archives" | Out-Null
+            Compress-Archive -Path "VIDEOS\*.mp4" -DestinationPath "archives\${archiveName}.zip" -Force
+            
+            Write-Host "Archive created successfully"
+            
+            # Clear VIDEOS folder
+            Remove-Item -Path "VIDEOS\*.mp4" -Force
+            Write-Host "VIDEOS folder cleared"
           } else {
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add links.txt
-            git commit -m "Update links.txt"
-            git pull --rebase origin main || Write-Host "No changes to pull"
-            git push origin main
-            Write-Host "Committed and pushed links.txt"
+            Write-Host "No videos to archive"
           }
 
-      - name: Commit in batches of 50
-        shell: bash
+      - name: Advance to next batch
+        if: steps.check_batch.outcome == 'success'
         run: |
-          # Get list of untracked files in VIDEOS_NEW/
-          mapfile -t files < <(git ls-files --others --exclude-standard VIDEOS_NEW/)
+          python -c "from batch_manager import advance_to_next_batch, prepare_current_batch, print_batch_status; advance_to_next_batch(); prepare_current_batch(); print_batch_status()"
 
-          # Filter out VIDEOS_NEW/Video_0.mp4
-          filtered_files=()
-          for file in "${files[@]}"; do
-            if [[ "$file" != "VIDEOS_NEW/Video_0.mp4" ]]; then
-              filtered_files+=("$file")
-            fi
-          done
+      - name: Commit and push changes
+        if: steps.check_batch.outcome == 'success'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Add all tracking files
+          git add counter.txt batch_progress.txt links.txt
+          
+          # Add archives if they exist
+          if (Test-Path "archives") {
+            git add archives/
+          }
+          
+          # Check if there are changes to commit
+          $status = git status --porcelain
+          if ($status) {
+            $batchNum = Get-Content "batch_progress.txt"
+            git commit -m "Automated: Completed batch $($batchNum - 1), advanced to batch $batchNum"
+            
+            # Pull and push with retry logic
+            $maxRetries = 3
+            $retryCount = 0
+            $success = $false
+            
+            while (-not $success -and $retryCount -lt $maxRetries) {
+              try {
+                git pull --rebase origin main
+                git push origin main
+                $success = $true
+                Write-Host "Successfully pushed changes"
+              } catch {
+                $retryCount++
+                Write-Host "Push failed, attempt $retryCount of $maxRetries"
+                Start-Sleep -Seconds 5
+              }
+            }
+            
+            if (-not $success) {
+              Write-Host "Failed to push after $maxRetries attempts"
+              exit 1
+            }
+          } else {
+            Write-Host "No changes to commit"
+          }
 
-          total=${#filtered_files[@]}
-          batch_size=50
+      - name: Upload archives as artifacts
+        if: steps.check_batch.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-archives
+          path: archives/*.zip
+          retention-days: 30  # Keep archives for 30 days
+          if-no-files-found: ignore
 
-          echo "Total files to commit: $total"
-          echo "Batch size: $batch_size"
+      - name: Trigger next workflow run
+        if: steps.check_batch.outcome == 'success'
+        run: |
+          # Check if there are more batches to process
+          python -c "from batch_manager import get_batch_info; info = get_batch_info(); exit(0 if info['links_remaining'] > 0 else 1)"
+          
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "More batches remaining. Workflow will be triggered by the commit."
+          } else {
+            Write-Host "All batches completed! 🎉"
+          }
 
-          for ((i=0; i<$total; i+=$batch_size)); do
-            batch=("${filtered_files[@]:i:batch_size}")
-            echo "Processing batch: $((i+1)) to $((i + ${#batch[@]}))"
-            echo "Files added to staging: ${batch[@]}"
-
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-
-            git add "${batch[@]}"
-            git commit -m "Batch commit: files $((i+1)) to $((i + ${#batch[@]}))"
-            echo "Committed batch: $((i+1)) to $((i + ${#batch[@]}))"
-
-            git pull --rebase origin main || echo "No changes to pull"
-            git push origin main
-            echo "Pushed batch: $((i+1)) to $((i + ${#batch[@]}))"
-          done
+      - name: Summary
+        if: always()
+        run: |
+          Write-Host "`n=========================================="
+          Write-Host "WORKFLOW SUMMARY"
+          Write-Host "=========================================="
+          
+          if (Test-Path "batch_progress.txt") {
+            python -c "from batch_manager import print_batch_status; print_batch_status()"
+          }
+          
+          if (Test-Path "archives") {
+            $archiveCount = (Get-ChildItem -Path "archives" -Filter "*.zip").Count
+            Write-Host "Total archives created: $archiveCount"
+          }
+          
+          Write-Host "=========================================="
 
